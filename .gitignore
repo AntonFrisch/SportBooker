@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+last_booking_response.html
+booking_confirmation_*.html
