@@ -161,7 +161,16 @@ def wait_until_window_start(opening_dt: datetime) -> None:
         time.sleep(sleep_seconds)
 
 
-def poll_loop(category_url: str, kursnr: str, opening_dt: datetime, email: str, password: str) -> bool:
+def poll_loop(
+    category_url: str,
+    kursnr: str,
+    opening_dt: datetime,
+    email: str,
+    password: str,
+    iban: str | None = None,
+    bic: str | None = None,
+    kontoinhaber: str | None = None,
+) -> bool:
     window_start = opening_dt - timedelta(seconds=3)
     window_end = opening_dt + timedelta(seconds=10)
 
@@ -191,7 +200,7 @@ def poll_loop(category_url: str, kursnr: str, opening_dt: datetime, email: str, 
                 print(f"Titel: {course['title']}")
                 print("=" * 60)
                 try:
-                    result_html, result_url = run_booking_flow(category_url, kursnr, email, password)
+                    result_html, result_url = run_booking_flow(category_url, kursnr, email, password, iban, bic, kontoinhaber)
                 except (RuntimeError, requests.RequestException) as exc:
                     print(f"BUCHUNG FEHLGESCHLAGEN: {exc}")
                     return False
@@ -285,7 +294,32 @@ def set_field(fields: list[tuple[str, str]], name: str, value: str) -> list[tupl
     return [f for f in fields if f[0] != name] + [(name, value)]
 
 
-def run_booking_flow(category_url: str, kursnr: str, email: str, password: str, max_confirm_steps: int = 4) -> tuple[str, str]:
+def apply_payment_overrides(form, fields: list[tuple[str, str]], overrides: dict) -> list[tuple[str, str]]:
+    """Ueberschreibt IBAN/BIC/Kontoinhaber nur, wenn ein Wert gesetzt ist UND
+    das Feld in diesem Schritt noch editierbar (nicht hidden) ist - analog zum
+    tnbed-Handling, um die Pruefsumme spaeterer Schritte nicht zu brechen.
+    Ohne gesetzten Override bleibt der aus dem Account vorausgefuellte Wert
+    (falls vorhanden) unveraendert erhalten.
+    """
+    for name, value in overrides.items():
+        if not value:
+            continue
+        inp = form.find("input", attrs={"name": name})
+        if inp is not None and (inp.get("type") or "text").lower() != "hidden":
+            fields = set_field(fields, name, value)
+    return fields
+
+
+def run_booking_flow(
+    category_url: str,
+    kursnr: str,
+    email: str,
+    password: str,
+    iban: str | None = None,
+    bic: str | None = None,
+    kontoinhaber: str | None = None,
+    max_confirm_steps: int = 4,
+) -> tuple[str, str]:
     """Fuehrt buchen -> Login -> (ggf. mehrere) Bestaetigungsschritte aus.
 
     Nach dem Login liefert die Seite ein mit den Account-Daten vorausgefuelltes
@@ -302,6 +336,10 @@ def run_booking_flow(category_url: str, kursnr: str, email: str, password: str, 
 
     for _ in range(max_confirm_steps):
         soup = BeautifulSoup(response.text, "html.parser")
+        if soup.find(class_="bs_meldung"):
+            # Terminale Fehlerseite (z.B. "bereits gebucht") - nicht weiter
+            # resubmitten, sonst wird der Vorgang vom Server zurueckgesetzt.
+            break
         form = soup.find("form", attrs={"name": "bsform"})
         if form is None:
             break
@@ -309,6 +347,7 @@ def run_booking_flow(category_url: str, kursnr: str, email: str, password: str, 
             break
 
         fields = extract_form_fields(form)
+        fields = apply_payment_overrides(form, fields, {"iban": iban, "bic": bic, "kontoinh": kontoinhaber})
         checkbox = form.find("input", attrs={"name": "tnbed", "type": "checkbox"})
         if checkbox is not None:
             # AGB noch nicht bestaetigt (Checkbox-Schritt) - jetzt setzen.
@@ -336,10 +375,21 @@ def summarize_result(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     title = soup.title.get_text(strip=True) if soup.title else None
     messages = []
+
+    # bs_meldung-Divs sind verschachtelt (aeusseres enthaelt zusaetzlichen
+    # Kontext) - nur das innerste (spezifischste) je Fundstelle nehmen.
+    meldungen = soup.find_all(class_="bs_meldung")
+    for el in meldungen:
+        if not el.find(class_="bs_meldung"):
+            text = el.get_text(" ", strip=True)
+            if text:
+                messages.append(text)
+
     for el in soup.find_all(class_=("bs_text_red", "bs_error", "bs_form_error")):
         text = el.get_text(" ", strip=True)
-        if text:
+        if text and not any(text in m or m in text for m in messages):
             messages.append(text)
+
     lines = []
     if title:
         lines.append(f"Seitentitel: {title}")
@@ -348,32 +398,46 @@ def summarize_result(html: str) -> str:
     return "\n".join(lines) if lines else "(keine eindeutigen Status-Hinweise gefunden, siehe gespeicherte HTML-Datei)"
 
 
-def report_booking_result(result_html: str, result_url: str, kursnr: str) -> None:
+def report_booking_result(result_html: str, result_url: str, kursnr: str) -> bool:
+    """Gibt das Ergebnis aus und liefert True nur bei erkanntem Erfolg zurueck."""
+    soup = BeautifulSoup(result_html, "html.parser")
+    success = soup.find(class_="bs_meldung") is None
+
+    print("BUCHUNG ERFOLGREICH" if success else "BUCHUNG NICHT ERFOLGREICH")
     print(summarize_result(result_html))
 
-    # Die Buchungsbestaetigung ist nur der Inhalt dieser letzten Antwort - es
-    # gibt dafuer keine eigene, spaeter abrufbare URL auf der Website (anders
-    # als beim manuellen Buchen im Browser mit target=_blank). Deshalb lokal
-    # speichern und als klickbaren file://-Link ausgeben.
+    # Die Buchungsbestaetigung/Fehlerseite ist nur der Inhalt dieser letzten
+    # Antwort - es gibt dafuer keine eigene, spaeter abrufbare URL auf der
+    # Website (anders als beim manuellen Buchen im Browser mit target=_blank).
+    # Deshalb lokal speichern und als klickbaren file://-Link ausgeben.
     confirmation_path = os.path.abspath(f"booking_confirmation_{kursnr}.html")
     with open(confirmation_path, "w", encoding="utf-8") as f:
         f.write(result_html)
-    print(f"Bestätigung lokal gespeichert, zum Pruefen im Browser oeffnen: file://{confirmation_path}")
+    print(f"Antwort lokal gespeichert, zum Pruefen im Browser oeffnen: file://{confirmation_path}")
 
     link = find_confirmation_link(result_html, result_url)
     if link:
         print(f"Zusaetzlich auf der Seite verlinkt: {link}")
 
+    return success
 
-def run_login_test(category_url: str, kursnr: str, email: str, password: str) -> int:
+
+def run_login_test(
+    category_url: str,
+    kursnr: str,
+    email: str,
+    password: str,
+    iban: str | None = None,
+    bic: str | None = None,
+    kontoinhaber: str | None = None,
+) -> int:
     print(f"Starte Buchungsvorgang fuer Kurs {kursnr} ({category_url})...")
     try:
-        result_html, result_url = run_booking_flow(category_url, kursnr, email, password)
+        result_html, result_url = run_booking_flow(category_url, kursnr, email, password, iban, bic, kontoinhaber)
     except (RuntimeError, requests.RequestException) as exc:
         print(f"BUCHUNG FEHLGESCHLAGEN: {exc}")
         return 1
-    report_booking_result(result_html, result_url, kursnr)
-    return 0
+    return 0 if report_booking_result(result_html, result_url, kursnr) else 1
 
 
 def main() -> int:
@@ -386,9 +450,19 @@ def main() -> int:
         action="store_true",
         help="Fuehrt den echten Buchungs-/Login-Flow sofort aus, ohne auf die Oeffnungszeit zu warten.",
     )
+    parser.add_argument(
+        "--profile",
+        help=(
+            "Pfad zu einer zusaetzlichen env-Datei mit HSP_CATEGORY_URL/HSP_KURSNR/"
+            "HSP_OPENING_TIME fuer einen bestimmten Kurs (z.B. courses/laufen.env). "
+            "Zugangsdaten bleiben in der normalen .env."
+        ),
+    )
     args = parser.parse_args()
 
     load_dotenv()
+    if args.profile:
+        load_dotenv(args.profile, override=True)
     category_url = args.url or os.environ.get("HSP_CATEGORY_URL")
     kursnr = args.kursnr or os.environ.get("HSP_KURSNR")
 
@@ -416,8 +490,15 @@ def main() -> int:
         print(f"Fehlende Angaben (siehe .env): {', '.join(missing)}")
         return 1
 
+    # Optional - nur fuer bezahlpflichtige Kurse, und nur falls im Account noch
+    # kein Konto hinterlegt ist oder ein anderes genutzt werden soll. Ohne
+    # diese Angaben wird ein bereits im Account gespeichertes Konto verwendet.
+    iban = os.environ.get("HSP_IBAN") or None
+    bic = os.environ.get("HSP_BIC") or None
+    kontoinhaber = os.environ.get("HSP_KONTOINHABER") or None
+
     if args.login_test:
-        return run_login_test(category_url, kursnr, email, password)
+        return run_login_test(category_url, kursnr, email, password, iban, bic, kontoinhaber)
 
     opening_time_raw = os.environ.get("HSP_OPENING_TIME")
     if not opening_time_raw:
@@ -426,7 +507,7 @@ def main() -> int:
     opening_dt = parse_opening_time(opening_time_raw)
 
     wait_until_window_start(opening_dt)
-    success = poll_loop(category_url, kursnr, opening_dt, email, password)
+    success = poll_loop(category_url, kursnr, opening_dt, email, password, iban, bic, kontoinhaber)
     return 0 if success else 1
 
 
